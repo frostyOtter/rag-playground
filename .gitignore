@@ -11,3 +11,4 @@ wheels/
 .env
 data/
 knowledge-contexts/
+extracted_contexts/
