@@ -24,7 +24,7 @@ from src.models.common_pdf_models import (
     # PageAnnotation,
     # PageLink,
 )
-from pymupdf_processor import PyMuPDFProcessor  # For reading documents
+from src.data_service.pymupdf_processor import PyMuPDFProcessor
 
 
 class PyMuPDF4LLMProcessor(DataProcessorBase):
