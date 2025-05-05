@@ -158,7 +158,7 @@ if __name__ == "__main__":
 
     load_dotenv()
 
-    API_KEY = os.getenv("GOOGLE_API_KEY")
+    API_KEY = os.getenv("GEMINI_API_KEY")
     # Ensure GOOGLE_API_KEY is set in your environment variables before running
 
     gemini_provider = GeminiServiceProvider(api_key=API_KEY)
