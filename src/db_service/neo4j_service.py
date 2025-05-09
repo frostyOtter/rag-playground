@@ -7,8 +7,11 @@ sys.path.append(
 from loguru import logger
 from typing import Optional, List
 from langchain_neo4j import Neo4jGraph, Neo4jVector
+from langchain_core.embeddings import Embeddings
 from src.db_service.db_base import VectorDBBase
 from src.models.common_pdf_models import DocumentChunk
+from src.llm_service.llm_base import LLMProviderBase
+from pydantic import BaseModel
 import json
 
 
@@ -30,52 +33,23 @@ class Neo4jService(VectorDBBase):
         self.username = username
         self.password = password
         self.database = database
-        self.graph: Optional[Neo4jGraph] = None
-        self.vector_store: Optional[Neo4jVector] = None
-        self.llm_service = None
-        self.embeddings_service = None
-
-    def initialize_cohere_embedding_service(
-        self,
-        api_key: str,
-        framework: str = "langchain",
-        model_name: str = "embed-english-v3.0",
-    ) -> None:
-        if framework == "langchain":
-            from langchain_cohere.embeddings import CohereEmbeddings
-
-            self.embeddings_service = CohereEmbeddings(
-                cohere_api_key=api_key, model=model_name
-            )
-        else:
-            raise ValueError(f"Currently unsupported embedding provider: {framework}")
-
-    def initialize_gemini_llm_service(
-        self,
-        api_key: str,
-        framework: str = "langchain",
-        model_name: str = "gemini-2.0-flash",
-    ) -> None:
-        if framework == "langchain":
-            from src.llm_service.gemini_service import GeminiServiceProvider
-
-            self.llm_service = GeminiServiceProvider(
-                model_name=model_name, api_key=api_key, temperature=0.1
-            )
-
-        else:
-            raise ValueError(f"Currently unsupported LLM provider: {framework}")
+        self.graph: Optional[Neo4jGraph] = (
+            kwargs.get("graph", None)
+            if kwargs.get("graph") and isinstance(kwargs.get("graph"), Neo4jGraph)
+            else None
+        )
 
     def connect(self, **kwargs) -> None:
         """Connect to Neo4j instance."""
         try:
-            self.graph = Neo4jGraph(
-                url=self.uri,
-                username=self.username,
-                password=self.password,
-                database=self.database,
-            )
-            logger.info(f"Connected to Neo4j at {self.uri}")
+            if not self.graph:
+                self.graph = Neo4jGraph(
+                    url=self.uri,
+                    username=self.username,
+                    password=self.password,
+                    database=self.database,
+                )
+            logger.info(f"Connected to Neo4j")
             self.graph.refresh_schema()
             logger.info("Graph schema refreshed")
         except Exception as e:
@@ -85,7 +59,6 @@ class Neo4jService(VectorDBBase):
     def disconnect(self) -> None:
         """Disconnect from Neo4j."""
         self.graph = None
-        self.vector_store = None
         logger.info("Disconnected from Neo4j")
 
     # Phase 1: Basic chunk storage
@@ -126,7 +99,7 @@ class Neo4jService(VectorDBBase):
 
         logger.success(f"Stored {len(chunks)} chunks for source: {source_file}")
 
-    # Phase 2: Add intelligence layer
+    # Phase 2: Add relationship layers
     def enhance_with_metadata(self, source_file: str) -> None:
         """Phase 2: Add metadata and create document structure."""
         if not self.graph:
@@ -163,40 +136,20 @@ class Neo4jService(VectorDBBase):
         logger.info(f"Created {result[0]['connected']} NEXT relationships")
 
     # Phase 3: Extracted entities
-    def extract_entities(self, source_file: str) -> None:
+    def extract_entities(self, source_file: str, entity_schema: BaseModel, llm_service: Optional[LLMProviderBase]) -> None:
         """Phase 3: Extract entities from chunks using Gemini."""
         if not self.graph:
             raise ConnectionError("Not connected to Neo4j")
 
-        if not self.llm_service:
-            raise ValueError(
-                "LLM service not initialized, cannot extract entities using LLM."
-            )
-
         # Entity extraction prompt
         extraction_prompt = """
-        Extract the following information from the resume chunk. Return ONLY a JSON object:
-        
-        {
-        "person": {"name": string, "email": string, "phone": string},
-        "companies": [{"name": string, "role": string, "start_date": string, "end_date": string}],
-        "skills": [string],
-        "education": [{"institution": string, "degree": string, "year": string}],
-        "certifications": [string]
-        }
-        
+        Follow the schema to extract the following information from the resume chunk.
         If information isn't found, use empty string or empty array.
         
         Resume chunk:
         {chunk_text}
         """
 
-        # # Get chunks without processed flag
-        # chunks_query = """
-        # MATCH (c:Chunk {source: $source})
-        # RETURN c.id as chunk_id, c.text as text
-        # LIMIT 5
-        # """
         chunks_query = """
         MATCH (c:Chunk {source: $source})
         RETURN c.id as chunk_id, c.text as text, c.chunk_index as index
@@ -209,7 +162,6 @@ class Neo4jService(VectorDBBase):
                 logger.warning(f"No unprocessed chunks found for source: {source_file}")
                 return
             logger.debug(f"Found {len(results)} unprocessed chunks.")
-
             for result in results:
                 try:
                     # Prepare messages
@@ -225,21 +177,8 @@ class Neo4jService(VectorDBBase):
                             ),
                         },
                     ]
-
-                    response = self.llm_service.generate_response(messages=messages)
-                    try:
-                        response = response.strip()
-                        if response.startswith("```json"):
-                            response = response[7:-3].strip()
-                        entities = json.loads(response)
-                    except json.JSONDecodeError as e:
-                        from ast import literal_eval
-
-                        entities = literal_eval(response)
-
-                    except Exception as e:
-                        logger.error(f"Failed to parse response as JSON: {response}")
-                        continue
+                    
+                    entities = llm_service.generate_response(messages=messages, response_schema=entity_schema)
 
                     # Store entities in graph
                     self._store_extracted_entities(result["chunk_id"], entities)
@@ -379,101 +318,9 @@ class Neo4jService(VectorDBBase):
         except Exception as e:
             logger.error(f"Error storing entities for chunk {chunk_id}: {e}")
 
-    def create_vector_index(
-        self,
-        index_name: str,
-        node_label: str = "Chunk",
-        property_name: str = "embedding",
-        dimensions: int = 1536,  # Default for OpenAI embeddings
-        similarity_function: str = "cosine",
-    ) -> None:
-        """Create a vector index in Neo4j."""
-        query = f"""
-            CREATE VECTOR INDEX {index_name} IF NOT EXISTS
-            FOR (n:{node_label}) ON (n.{property_name})
-            OPTIONS {{
-                indexConfig: {{
-                    `vector.dimensions`: {dimensions},
-                    `vector.similarity_function`: '{similarity_function}'
-                }}
-            }}
-        """
-        try:
-            self.graph.query(query)
-            logger.info(f"Created vector index: {index_name}")
-        except Exception as e:
-            logger.error(f"Failed to create vector index: {e}")
-            raise
-
-    # Phase 4: Add vector embeddings
-    def add_vector_embeddings(
-        self, source_file: str, index_name: str = "resume_chunks"
-    ) -> None:
-        """Phase 4: Add vector embeddings and create index."""
-        if not self.graph:
-            raise ConnectionError("Not connected to Neo4j")
-
-        # Check if index exists using proper vector index query
-        vector_index_check = f"""
-        SHOW VECTOR INDEXES WHERE name = '{index_name}'
-        """
-        result = self.graph.query(vector_index_check)
-        index_exists = any(row["name"] == index_name for row in result)
-        if not index_exists:
-            logger.info(f"Vector index {index_name} does not exist. Creating...")
-            self.create_vector_index(index_name, "Chunk", "embedding", 1024, "cosine")
-            logger.info(f"Created vector index: {index_name}")
-
-        # Generate embeddings for chunks
-        embed_query = """
-        MATCH (c:Chunk {source: $source})
-        RETURN c.id as id, c.text as text
-        LIMIT 10
-        """
-
-        results = self.graph.query(embed_query, {"source": source_file})
-        if not results:
-            raise ValueError(
-                f"No chunks found from {source_file}, cannot generate embeddings."
-            )
-        chunks_text = [result["text"] for result in results]
-        chunks_id = [result["id"] for result in results]
-        MAX_CHUNK_SIZE = 50
-
-        # Store embedding
-        update_query = """
-        MATCH (c:Chunk {id: $id})
-        SET c.embedding = $embedding
-        """
-        from tqdm import tqdm
-
-        for i in tqdm(
-            range(0, len(chunks_text), MAX_CHUNK_SIZE),
-            desc="Extracting embeddings",
-            unit="batch",
-        ):
-            chunks_text_batch = chunks_text[i : i + MAX_CHUNK_SIZE]
-            chunks_id_batch = chunks_id[i : i + MAX_CHUNK_SIZE]
-            try:
-                # Generate embedding for this batch
-                chunks_embeddings_batch = self.embeddings_service.embed_documents(
-                    chunks_text_batch
-                )
-
-                # Store embeddings for this batch
-                for chunk_embedding, chunk_id in tqdm(
-                    zip(chunks_embeddings_batch, chunks_id_batch),
-                    desc="Storing embeddings",
-                    total=len(chunks_id_batch),
-                ):
-                    self.graph.query(
-                        update_query, {"id": chunk_id, "embedding": chunk_embedding}
-                    )
-            except Exception as e:
-                raise RuntimeError(f"Failed to process embeddings: {e}")
-
+    # Phase 4: Connect all entities and create advanced relationships
     def create_knowledge_graph(self, source_file: str) -> None:
-        """Phase 5: Connect all entities and create advanced relationships."""
+        """Phase 4: Connect all entities and create advanced relationships."""
         if not self.graph:
             raise ConnectionError("Not connected to Neo4j")
 
@@ -499,7 +346,7 @@ class Neo4jService(VectorDBBase):
         MERGE (p)-[:HAS_EDUCATION]->(edu)
         RETURN count(DISTINCT edu) as education_linked
         """
-
+        
         # Create resume-level aggregations
         create_resume_summary_query = """
         MATCH (r:Resume {id: $source})
@@ -517,43 +364,41 @@ class Neo4jService(VectorDBBase):
         """
 
         results = []
+        logger.info(f"Connecting skills")
         results.append(self.graph.query(connect_skills_query, {"source": source_file}))
+        logger.info(f"Connecting experiences")
         results.append(
             self.graph.query(connect_experience_query, {"source": source_file})
         )
+        logger.info(f"Connecting educations")
         results.append(
             self.graph.query(connect_education_query, {"source": source_file})
         )
+        logger.info(f"Creating resume summary")
         results.append(
             self.graph.query(create_resume_summary_query, {"source": source_file})
         )
 
-    # Query interface implementation
-    def query(self, query_text: str, limit: int = 5, **kwargs):
-        """Query using vector similarity search."""
+
+    def get_vector_index(
+        self, node_label:str = "Chunk", text_node_properties:List[str]=["text"], embedding_node_property:str="embedding", embedding_service:Embeddings=None
+    ) -> Neo4jVector:
+        """Get Neo4j Vector Index."""
         if not self.graph:
             raise ConnectionError("Not connected to Neo4j")
-
-        if not self.embeddings_service:
-            raise ValueError("Embeddings service not initialized")
-        # Generate query embedding
-        query_embedding = self.embeddings_service.embed_query(query_text)
-
-        search_query = """
-        CALL db.index.vector.queryNodes('resume_chunks', $limit, $embedding)
-        YIELD node, score
-        RETURN node.text as text, node.source as source, score
-        ORDER BY score DESC
-        """
-
-        results = self.graph.query(
-            search_query, {"embedding": query_embedding, "limit": limit}
+        
+        vector_index = Neo4jVector.from_existing_graph(
+            embedding=embedding_service,
+            url=self.uri,
+            username=self.username,
+            password=self.password,
+            index_name=self.database,
+            node_label=node_label,
+            text_node_properties=text_node_properties,
+            embedding_node_property=embedding_node_property,
         )
-        # Parse JSON back to dict
-        for result in results:
-            if "metadata" in result and result["metadata"]:
-                result["metadata"] = json.loads(result["metadata_json"])
-        return results
+
+        return vector_index
 
     def get_by_ids(self, ids: List[str], **kwargs):
         """Get chunks by their IDs."""
@@ -603,98 +448,28 @@ class Neo4jService(VectorDBBase):
         results = self.graph.query(info_query)
         return results
 
-    def ask(self, user_message: str, limit: int = 5, **kwargs) -> str:
-
+    def query(self, user_message: str, limit: int = 5, **kwargs) -> str:
+        """Query the knowledge graph using natural language."""
         if not self.graph:
             raise ConnectionError("Not connected to Neo4j")
-
+        
         if not self.llm_service:
-            raise ValueError("LLM service not initialized")
-
-        if not self.embeddings_service:
-            raise ValueError("Embeddings service not initialized")
-
-        # First, search for relevant chunks using vector similarity
-        query_embedding = self.embeddings_service.embed_query(user_message)
-
-        search_query = """
-        CALL db.index.vector.queryNodes('resume_chunks', $limit, $embedding)
-        YIELD node, score
-        
-        // Get related entities for each chunk
-        WITH node, score
-        OPTIONAL MATCH (node)-[:CONTAINS|MENTIONS]->(entity)
-        
-        RETURN node.text as chunk_text, 
-            node.source as source,
-            score,
-            collect(DISTINCT labels(entity)[0] + ': ' + COALESCE(entity.name, entity.title, entity.institution, '')) as related_entities
-        ORDER BY score DESC
-        """
-
+            raise ValueError("LLM service not initialized. Call initialize_gemini_llm_service first.")
+            
         try:
-            search_results = self.graph.query(
-                search_query, {"embedding": query_embedding, "limit": limit}
-            )
-
-            # Build context from search results
-            context_parts = []
-            for result in search_results:
-                logger.info(f"Found result: {result["source"]}")
-                chunk_context = f"Source: {result['source']}\n"
-                chunk_context += f"Content: {result['chunk_text']}\n"
-
-                if result["related_entities"]:
-                    chunk_context += (
-                        f"Related entities: {', '.join(result['related_entities'])}\n"
-                    )
-
-                chunk_context += f"Relevance score: {result['score']:.3f}\n"
-                chunk_context += "-" * 50 + "\n"
-                context_parts.append(chunk_context)
-
-            # Combine all context
-            full_context = "\n".join(context_parts)
-
-            # Create prompt for LLM
-            prompt = f"""You are an AI assistant analyzing resume data from a knowledge graph. 
-    Based on the following context retrieved from the knowledge graph, please answer the user's question.
-
-    User Question: {user_message}
-
-    Knowledge Graph Context:
-    {full_context}
-
-    Please provide a helpful and accurate response based on the retrieved information. If the context doesn't contain enough information to answer the question, please say so.
-    """
-
-            # Generate LLM response
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that answers questions about resume data stored in a knowledge graph.",
-                },
-                {"role": "human", "content": prompt},
-            ]
-
-            # Use kwargs for additional LLM parameters
-            llm_kwargs = {
-                "temperature": kwargs.get("temperature", 0.7),
-                "max_tokens": kwargs.get("max_tokens", 500),
-            }
-
-            response = self.llm_service.generate_response(
-                messages=messages, **llm_kwargs
-            )
-
+            # Initialize the Cypher QA chain
+            qa_chain = self.llm_service.initialize_cypher_qa_chain(self.graph)
+            
+            # Run the query
+            response = qa_chain.run(user_message)
             return response
-
+            
         except Exception as e:
-            logger.error(f"Error in ask function: {e}")
-            # Fallback to basic response
-            return (
-                f"I encountered an error while searching the knowledge graph: {str(e)}"
-            )
+            logger.error(f"Error querying knowledge graph: {e}")
+            raise
+    
+    def ask(self, user_message: str, limit: int = 5, **kwargs) -> str:
+        raise DeprecationWarning("Beep Boop, The function ask is deprecated. Use query instead.")
 
 
 if __name__ == "__main__":
@@ -743,34 +518,31 @@ if __name__ == "__main__":
         data_processor = PyMuPDF4LLMProcessor()
 
         try:
+            from tqdm import tqdm
             # Example resume file
-            for file in all_files:
-                chunks = data_processor.chunks_document(file)
+            for file in tqdm(all_files, total=len(all_files), desc="Beep Boop Beep Boop"):
                 source_file = os.path.basename(file).replace(".pdf", "")
-
+                logger.info(f"Chunking document: {source_file}")
+                chunks = data_processor.chunks_document(file)
+                
                 # Phase 1: Store raw chunks
+                logger.info(f"Phase 1: Storing raw chunks")
                 neo4j.add_documents(chunks, source_file)
-                logger.debug(f"Phase 1 completed")
-
                 # Phase 2: Add metadata and structure
+                logger.info(f"Phase 2: Adding metadata and structure")
                 neo4j.enhance_with_metadata(source_file)
 
-                logger.debug("Phase 2 completed, added metadata and structure")
                 # Phase 3: Extract entities
+                logger.info(f"Phase 3: Extracting entities using LLM")
                 gemini_api_key = os.getenv("GEMINI_API_KEY")
-                neo4j.initialize_gemini_llm_service(api_key=gemini_api_key)
-                neo4j.extract_entities(source_file)
-                logger.debug("Phase 3 completed, extracted entities")
+                from src.llm_service.gemini_service import GeminiServiceProvider
+                gemini_llm_service = GeminiServiceProvider(api_key=gemini_api_key)
+                from src.models.resume_models import ResumeEntities
+                neo4j.extract_entities(source_file, ResumeEntities, gemini_llm_service)
 
-                # Phase 4: Add vector embeddings
-                cohere_api_key = os.getenv("COHERE_API_KEY")
-                neo4j.initialize_cohere_embedding_service(api_key=cohere_api_key)
-                neo4j.add_vector_embeddings(source_file)
-                logger.debug("Phase 4 completed, added vector embeddings")
-
-                # Phase 5: Create knowledge graph
+                # Phase 4: Create knowledge graph
+                logger.info(f"Phase 4: Creating knowledge graph")
                 neo4j.create_knowledge_graph(source_file)
-                logger.debug("Phase 5 completed, created knowledge graph")
 
                 logger.success(f"Successfully processed file: {file}")
 
@@ -782,21 +554,15 @@ if __name__ == "__main__":
     if task == "query":
         user_message = sys.argv[2]
         try:
+            from src.llm_service.gemini_service import GeminiServiceProvider
             gemini_api_key = os.getenv("GEMINI_API_KEY")
-            neo4j.initialize_gemini_llm_service(api_key=gemini_api_key)
-            cohere_api_key = os.getenv("COHERE_API_KEY")
-            neo4j.initialize_cohere_embedding_service(api_key=cohere_api_key)
+            gemini_llm_service = GeminiServiceProvider(api_key=gemini_api_key)
+            cypher_qa_chain_client = gemini_llm_service.initialize_cypher_qa_chain(neo4j.graph)
             # Example query
             logger.info(f"Message: {user_message}")
-            # query_results = neo4j.query(user_message, limit=3)
-            query_results = neo4j.ask(user_message=user_message)
+            query_results = cypher_qa_chain_client.invoke({"query": user_message})
+            # query_results = neo4j.query(user_message=user_message, llm_service=gemini_llm_service)
             logger.info(f"Query results: {query_results}")
-
-            # Get collection info
-            # collection_info = neo4j.get_collection_info()
-            # logger.info("Knowledge graph summary:")
-            # for info in collection_info:
-            #     logger.info(f"Label: {info['label']}, Count: {info['count']}")
 
         except Exception as e:
             logger.error(f"Error in Neo4j example run: {e}")
