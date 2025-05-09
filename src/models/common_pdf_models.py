@@ -5,7 +5,8 @@ Following domain modeling principles with simple, focused models.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from pydantic import BaseModel
 
 
 class ChunkingStrategy(Enum):
