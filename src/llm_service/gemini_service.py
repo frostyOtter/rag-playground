@@ -4,7 +4,7 @@ import os
 sys.path.append(
     os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 )
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 
 from loguru import logger
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -14,7 +14,9 @@ from langchain_core.exceptions import (
 )  # Or a more general LangChain/API exception
 
 from src.llm_service.llm_base import LLMProviderBase
-
+from pydantic import BaseModel
+from langchain_neo4j import GraphCypherQAChain
+from langchain.chains import RetrievalQA
 
 class GeminiServiceProvider(LLMProviderBase):
     """
@@ -55,6 +57,41 @@ class GeminiServiceProvider(LLMProviderBase):
         except Exception as e:
             logger.error(f"Failed to initialize ChatGoogleGenerativeAI client: {e}")
             raise RuntimeError(f"error: {e}") from e
+        
+
+    def initialize_retrieval_qa_client(
+        self, vector_index, chain_type: str = "stuff"
+    ) -> RetrievalQA:
+        """
+        params:
+        chain_type: type of chain (Langchain)
+        vector_index: VectorStore langchain wrapper
+        """
+        
+
+        return RetrievalQA.from_chain_type(
+            llm=self.client,
+            chain_type=chain_type,
+            retriever=vector_index.as_retriever(),
+        )
+
+    def initialize_cypher_qa_chain(
+        self,
+        graph_database,
+    ) -> GraphCypherQAChain:
+        
+        from langchain_neo4j import Neo4jGraph
+
+        if not isinstance(graph_database, Neo4jGraph):
+            logger.error("Graph database must be an instance from Langchain Neo4jGraph")
+            raise
+        return GraphCypherQAChain.from_llm(
+            cypher_llm=self.client,
+            qa_llm=self.client,
+            graph=graph_database,
+            verbose=True,
+            allow_dangerous_requests=True,
+        )
 
     def _convert_messages(self, messages: List[Dict[str, str]]) -> List[BaseMessage]:
         """Converts a list of {'role': str, 'content': str} dicts to LangChain BaseMessages."""
@@ -84,7 +121,7 @@ class GeminiServiceProvider(LLMProviderBase):
                 langchain_messages.append(HumanMessage(content=content))
         return langchain_messages
 
-    def generate_response(self, messages: List[Dict[str, str]], **kwargs) -> str:
+    def generate_response(self, messages: List[Dict[str, str]], response_schema: Optional[BaseModel] = None) -> str:
         """
         Generates a response from the Gemini model based on the provided messages.
 
@@ -115,13 +152,21 @@ class GeminiServiceProvider(LLMProviderBase):
                     "Message conversion resulted in an empty list. Check input format/content."
                 )
                 raise ValueError("No valid messages found after conversion.")
-
-            # Invoke the model
-            response = self.client.invoke(
-                langchain_messages
-            )  # Pass kwargs if needed: self.client.invoke(langchain_messages, **kwargs)
-            logger.info(f"Token Usage: {response.usage_metadata}")
-            response_content = response.content
+            
+            if response_schema:
+                structured_llm = self.client.with_structured_output(response_schema)
+                # Invoke the model
+                response = structured_llm.invoke(
+                    langchain_messages,
+                )
+                # Return the structured response
+                return response.model_dump()
+            else:
+                response = self.client.invoke(
+                    langchain_messages,
+                )
+                logger.info(f"Token Usage: {response.usage_metadata}")
+                response_content = response.content  
 
             return response_content
 
@@ -154,6 +199,15 @@ if __name__ == "__main__":
         sys.argv[1] if len(sys.argv) > 1 else "What is the capital of France?"
     )
 
+    # Write an example short Resume
+    resume_example = """
+    name: John Doe
+    email: john.doe@example.com
+    phone: 123-456-7890
+    companies:
+    
+    """
+
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -170,9 +224,11 @@ if __name__ == "__main__":
         },
         {
             "role": "human",
-            "content": user_message,
+            "content": resume_example,
         },
     ]
 
-    response_text = gemini_provider.generate_response(messages_to_send)
+    from src.models.resume_models import ResumeEntities
+
+    response_text = gemini_provider.generate_response(messages_to_send, response_schema=ResumeEntities)
     logger.info(f"Generated Response:\n{response_text}")
