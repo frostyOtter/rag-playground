@@ -4,7 +4,7 @@ import os
 sys.path.append(
     os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 )
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Callable, Dict, Any
 import cohere
 from loguru import logger
 
@@ -69,6 +69,22 @@ class CohereEmbeddingService(EmbeddingBase):
         except Exception as e:
             logger.error(f"Failed to initialize Cohere client: {e}")
             raise
+    
+    @staticmethod
+    def initialize_cohere_embedding_service(
+        api_key: str,
+        framework: str = "langchain",
+        model_name: str = "embed-english-v3.0",
+        model_params: Dict[str, Any] = {},
+    ) -> Callable:
+        if framework == "langchain":
+            from langchain_cohere.embeddings import CohereEmbeddings
+
+            return CohereEmbeddings(
+                cohere_api_key=api_key, model=model_name, **model_params
+            )
+        else:
+            raise ValueError(f"Currently unsupported embedding provider: {framework}")
 
     def generate_embeddings(self, text_list: List[str], **kwargs) -> List[List[float]]:
         """
